@@ -1,0 +1,12 @@
+honeypot:
+  host: 0.0.0.0
+  port: 2222
+#  timezone: Asia/Shanghai  # 时区
+  log_file: ssh_honeypot.log
+  log_format: "{timestamp} - IP: {ip}, Port: {port}, Username: {username}, Method: {method}, Details: {details}"
+  max_attempts: 0  # 限制最大尝试次数，0 表示不限制
+  debug: true  # 开启调试模式，日志输出到控制台
+keys:
+  rsa: server_host_rsa.pem
+  ecdsa: server_host_ecdsa.pem
+  ed25519: server_host_ed25519.pem
