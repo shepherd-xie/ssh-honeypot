@@ -1,3 +1,5 @@
+import concurrent.futures
+import logging
 import os
 import socket
 import threading
@@ -8,6 +10,8 @@ import pytz
 import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+import monitor
 
 CONFIG_FILE = "config.yaml"
 
@@ -68,47 +72,52 @@ def initialize_host_keys(keys_config):
     return host_keys
 
 
-def log_attempt(config, addr, username, method, details):
+def log_attempt(config, logger, addr, username, method, password, key_type, key_data):
     """记录登录尝试信息"""
     timestamp = get_current_time_in_timezone(config["honeypot"].get("timezone", "UTC"))
-    log_entry = config["honeypot"]["log_format"].format(
+    log_metric = monitor.LogMetric(
         timestamp=timestamp,
         ip=addr[0],
         port=addr[1],
         username=username,
         method=method,
-        details=details,
+        password=password,
+        key_type=key_type,
+        key_data=key_data,
     )
     # 写入日志文件
     with open(config["honeypot"]["log_file"], "a") as f:
-        f.write(log_entry + "\n")
+        f.write(log_metric.to_log_line() + "\n")
     # 调试模式下输出到控制台
     if config["honeypot"].get("debug", False):
-        print(f"DEBUG: {log_entry}")
+        logger.info(f"{log_metric.to_log_line()}")
+
+    # 推送到 Prometheus
+    monitor.push_to_prometheus(config, log_metric, logger)
 
 
 def get_current_time_in_timezone(timezone='UTC'):
     """获取当前时间并根据时区调整"""
     tz = pytz.timezone(timezone)
-    now = datetime.now(tz)
-    return now.strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now(tz)
 
 
 class SSHServer(paramiko.ServerInterface):
     """自定义 SSH 服务器"""
 
-    def __init__(self, config, addr):
+    def __init__(self, config, addr, logger):
         self.config = config
         self.addr = addr  # 连接的客户端地址
         self.event = threading.Event()
         self.attempts = 0  # 登录尝试次数
+        self.logger = logger
 
     def check_auth_password(self, username, password):
         self.attempts += 1
         if self.exceeds_max_attempts():
             return paramiko.AUTH_FAILED
         # 记录使用密码登录的尝试
-        log_attempt(self.config, self.addr, username, "password", password)
+        log_attempt(self.config, self.logger, self.addr, username, "password", password, "", "")
         return paramiko.AUTH_FAILED
 
     def check_auth_publickey(self, username, key):
@@ -120,9 +129,12 @@ class SSHServer(paramiko.ServerInterface):
         key_data = key.get_base64()  # 获取公钥数据
         log_attempt(
             self.config,
+            self.logger,
             self.addr,
             username,
-            f"publickey ({key_type})",
+            "publickey",
+            "",
+            key_type,
             key_data,
         )
         return paramiko.AUTH_FAILED
@@ -131,7 +143,7 @@ class SSHServer(paramiko.ServerInterface):
         """检查是否超过最大尝试次数"""
         max_attempts = self.config["honeypot"].get("max_attempts", 0)
         if max_attempts > 0 and self.attempts >= max_attempts:
-            print(f"超过最大登录尝试次数，断开连接：{self.addr}")
+            self.logger.waring(f"超过最大登录尝试次数，断开连接：{self.addr}")
             return True
         return False
 
@@ -140,41 +152,50 @@ class SSHServer(paramiko.ServerInterface):
         return "password,publickey"
 
 
-def start_honeypot(config):
+def handle_client(client, addr, config, host_keys, logger: logging.Logger):
+    """处理单个客户端连接"""
+    logger.info(f"收到连接：{addr}")
+    try:
+        transport = paramiko.Transport(client)
+        for key_type, key in host_keys.items():
+            transport.add_server_key(key)
+        ssh_server = SSHServer(config, addr, logger)
+        transport.start_server(server=ssh_server)
+
+        # 等待客户端打开一个通道
+        channel = transport.accept(20)
+        if channel is not None:
+            logger.info(f"客户端已打开通道：{addr}")
+            channel.close()
+    except Exception as e:
+        logger.error(f"处理连接时出错：{e}")
+    finally:
+        client.close()
+
+
+def start_honeypot(config, logger):
     """启动 SSH 蜜罐"""
     host_keys = initialize_host_keys(config["keys"])
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((config["honeypot"]["host"], config["honeypot"]["port"]))
     server.listen(100)
-    print(f"SSH 蜜罐运行中，监听 {config['honeypot']['host']}:{config['honeypot']['port']}")
+    logger.info(f"SSH 蜜罐运行中，监听 {config['honeypot']['host']}:{config['honeypot']['port']}")
 
-    while True:
-        client, addr = server.accept()
-        print(f"收到连接：{addr}")
-        try:
-            transport = paramiko.Transport(client)
-            for key_type, key in host_keys.items():
-                transport.add_server_key(key)
-            ssh_server = SSHServer(config, addr)
-            transport.start_server(server=ssh_server)
-
-            # 等待客户端打开一个通道
-            channel = transport.accept(20)
-            if channel is not None:
-                print(f"客户端已打开通道：{addr}")
-                channel.close()
-        except Exception as e:
-            print(f"处理连接时出错：{e}")
-        finally:
-            client.close()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config["honeypot"].get("max_threads", 20)) as executor:
+        while True:
+            client, addr = server.accept()
+            # 提交任务到线程池
+            executor.submit(handle_client, client, addr, config, host_keys, logger)
 
 
 if __name__ == "__main__":
     try:
         config = load_config()
-        start_honeypot(config)
+        logger = monitor.setup_logging_with_loki(config)
+        logger.info("SSH 蜜罐启动中...")
+        start_honeypot(config, logger)
     except KeyboardInterrupt:
-        print("蜜罐已停止")
+        logger.info("蜜罐已停止")
     except Exception as e:
-        print(f"错误：{e}")
+        logger.exception(f"发生错误：{e}")
