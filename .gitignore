@@ -1,4 +1,5 @@
 *.pem
 *.log
 .idea
+config.yaml
 venv

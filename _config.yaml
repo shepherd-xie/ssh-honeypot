@@ -1,0 +1,27 @@
+honeypot:
+  host: 0.0.0.0
+  port: 2222
+  timezone: Asia/Shanghai  # 时区
+  log_file: ssh_honeypot.log
+  log_format: "{timestamp} - IP: {ip}, Port: {port}, Username: {username}, Method: {method}, Details: {details}"
+  max_attempts: 0  # 限制最大尝试次数，0 表示不限制
+  debug: true  # 开启调试模式，日志输出到控制台
+  max_sessions: 20
+keys:
+  rsa: server_host_rsa.pem
+  ecdsa: server_host_ecdsa.pem
+  ed25519: server_host_ed25519.pem
+monitoring:
+  enable: true
+  prometheus_pushgateway: "http://localhost:9091/metrics/job/ssh_honeypot"
+  prometheus_job: "ssh_honeypot"
+  prometheus_push_interval: 30  # 推送间隔（秒）
+  prometheus_auth:
+    username: "your_username"
+    password: "your_password"
+  loki_endpoint: "http://localhost:3100/loki/api/v1/push"
+  loki_labels: {"job": "ssh_honeypot"}
+  loki_auth:
+    username: "your_username"
+    password: "your_password"
+

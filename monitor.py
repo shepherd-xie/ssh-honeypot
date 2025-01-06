@@ -1,52 +1,55 @@
+import time
 from datetime import datetime
 
 import requests
+from prometheus_client import push_to_gateway, CollectorRegistry, Counter, Gauge
 from requests.auth import HTTPBasicAuth
 
-import logging
-from logging_loki import LokiHandler
+# 定义全局 Prometheus 指标
+registry = CollectorRegistry()
+login_attempts_total = Counter(
+    'ssh_login_attempts_total',
+    'Total number of SSH login attempts',
+    ['method', 'result'],
+    registry=registry
+)
+active_connections = Gauge(
+    'ssh_active_connections',
+    'Current number of active SSH connections',
+    registry=registry
+)
 
 
-def setup_logging_with_loki(config):
-    """设置 Loki 日志记录器"""
-    log_level = config["honeypot"].get("log_level", "INFO").upper()
-    loki_url = config["monitoring"].get("loki_endpoint")
-    loki_labels = config["monitoring"].get("loki_labels", {"job": "ssh_honeypot"})
+def push_metrics_to_prometheus(config, logger):
+    """定期推送指标到 Prometheus Pushgateway"""
+    push_interval = config["monitoring"].get("prometheus_push_interval", 30)
+    pushgateway_url = config["monitoring"].get("prometheus_pushgateway")
+    job_name = config["monitoring"].get("prometheus_job", "ssh_honeypot")
+    auth_config = config["monitoring"].get("prometheus_auth", {})
 
-    if not loki_url:
-        raise ValueError("Loki 推送地址未配置！")
+    if not pushgateway_url:
+        logger.warning("Prometheus Pushgateway 地址未配置，跳过推送")
+        return
 
-    # 配置 LokiHandler
-    loki_handler = LokiHandler(
-        url=loki_url,
-        tags=loki_labels,
-        auth=(
-            config["monitoring"].get("loki_auth", {}).get("username"),
-            config["monitoring"].get("loki_auth", {}).get("password"),
-        ),
-        version="1",
-    )
+    # 定义 HTTP Basic Auth
+    auth = None
+    if "username" in auth_config and "password" in auth_config:
+        auth = HTTPBasicAuth(auth_config["username"], auth_config["password"])
 
-    # 设置格式化器
-    formatter = logging.Formatter(
-        fmt="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    loki_handler.setFormatter(formatter)
+    while True:
+        try:
+            # 自定义 handler 支持 Basic Auth
+            handler = None
+            if auth:
+                handler = requests.post
 
-    # 创建日志记录器
-    logger = logging.getLogger("SSH_Honeypot")
-    logger.setLevel(log_level)
-
-    # 控制台日志
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # 添加 LokiHandler
-    logger.addHandler(loki_handler)
-
-    return logger
+            # 推送指标
+            push_to_gateway(pushgateway_url, job=job_name, registry=registry, handler=handler)
+            logger.info("成功推送指标到 Prometheus Pushgateway")
+        except Exception as e:
+            logger.error(f"推送指标到 Prometheus Pushgateway 时出错: {e}")
+        finally:
+            time.sleep(push_interval)
 
 
 class LogMetric:
@@ -75,27 +78,3 @@ class LogMetric:
 
     def to_json(self):
         return
-
-
-def push_to_prometheus(config, log_metric, logger):
-    """推送指标到 Prometheus Pushgateway"""
-    if not config["monitoring"].get("enable", False):
-        logger.debug("监控未启用，跳过 Prometheus 推送")
-        return
-
-    prometheus_url = config["monitoring"].get("prometheus_pushgateway")
-    if not prometheus_url:
-        logger.warning("Prometheus Pushgateway 地址未配置，跳过推送")
-        return
-
-    metric_data = f"# HELP ssh_login_attempts Total login attempts\n"
-    metric_data += f"# TYPE ssh_login_attempts counter\n"
-    metric_data += log_metric.to_prometheus()
-
-    try:
-        response = requests.post(prometheus_url, data=metric_data)
-        response.raise_for_status()
-        logger.info("推送到 Prometheus 成功")
-    except requests.RequestException as e:
-        logger.error(f"推送到 Prometheus 失败: {e}")
-
